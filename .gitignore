@@ -1,0 +1,8 @@
+__pycache__/
+runs/
+figures/
+checkpoints/
+*.pt
+*.bin
+*.log
+*.jsonl

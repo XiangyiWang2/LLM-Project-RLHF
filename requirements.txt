@@ -1,0 +1,8 @@
+transformers>=4.44.0
+trl>=0.8.6
+datasets
+peft
+accelerate
+bitsandbytes
+evaluate
+deepspeed
