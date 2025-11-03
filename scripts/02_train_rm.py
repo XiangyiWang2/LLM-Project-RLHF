@@ -1,54 +1,92 @@
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
-import numpy as np
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-BASE = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k"
-tok = AutoTokenizer.from_pretrained(BASE, use_fast=True)
+from datasets import load_dataset, Value
+from transformers import (
+    AutoTokenizer, AutoModelForSequenceClassification,
+    TrainingArguments, Trainer, BitsAndBytesConfig
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+import torch
 
-ds = load_dataset("stanfordnlp/SHP", split="train[:5%]")
+BASE = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
+
+# --- Tokenizer & PAD ---
+tok = AutoTokenizer.from_pretrained(BASE, use_fast=False)
+added_pad = False
+if tok.pad_token is None:
+    tok.add_special_tokens({"pad_token": "[PAD]"})
+    added_pad = True
+tok.padding_side = "right"
+pad_id = tok.pad_token_id
+
+# --- Data: SHP（3k 起步） ---
+ds = load_dataset("stanfordnlp/SHP", split="train").shuffle(seed=42).select(range(3000))
 
 def map_pair(ex):
-    prompt = ex["history"][-1]["human"] if "history" in ex else ex.get("instruction","")
-    a, b = ex["response_0"], ex["response_1"]
-    # label: which is preferred (0 或 1)
-    pref = ex["labels"]
-    chosen = a if pref==0 else b
-    rejected = b if pref==0 else a
+    prompt = ex.get("history", "")
+    a = ex.get("human_ref_A", "")
+    b = ex.get("human_ref_B", "")
+    chosen, rejected = (a, b) if ex.get("labels", 1) == 1 else (b, a)
     return {
         "pos": f"Human: {prompt}\nAssistant: {chosen}",
-        "neg": f"Human: {prompt}\nAssistant: {rejected}"
+        "neg": f"Human: {prompt}\nAssistant: {rejected}",
     }
+ds = ds.map(map_pair)
 
-ds = ds.map(map_pair).remove_columns([c for c in ds.column_names if c not in ["pos","neg"]])
-ds = ds.shuffle(seed=42).select(range(min(5000, len(ds))))
-
-def explode(batch):
+def tokenize_batch(batch):
     pos = tok(batch["pos"], padding="max_length", truncation=True, max_length=512)
     neg = tok(batch["neg"], padding="max_length", truncation=True, max_length=512)
+    # 关键：labels 用 float（0.0/1.0），避免 Long dtype 报错
     return {
         "input_ids": pos["input_ids"] + neg["input_ids"],
         "attention_mask": pos["attention_mask"] + neg["attention_mask"],
-        "labels": [1]*len(batch["pos"]) + [0]*len(batch["neg"])
+        "labels": [1.0] * len(batch["pos"]) + [0.0] * len(batch["neg"]),
     }
+ds = ds.map(tokenize_batch, batched=True, remove_columns=ds.column_names)
+# 强制列类型为 float32，彻底稳
+ds = ds.cast_column("labels", Value("float32"))
 
-ds = ds.map(explode, batched=True, remove_columns=ds.column_names)
-
+# --- Model: 4bit + LoRA（SequenceClassification） ---
+bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
 model = AutoModelForSequenceClassification.from_pretrained(
-    BASE, num_labels=1, load_in_4bit=True, device_map="auto"
+    BASE, num_labels=1, quantization_config=bnb, device_map="auto"
 )
+if added_pad:
+    model.resize_token_embeddings(len(tok))
 
+model = prepare_model_for_kbit_training(model)
+peft_cfg = LoraConfig(
+    task_type=TaskType.SEQ_CLS,
+    r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
+    target_modules=["q_proj","k_proj","v_proj","o_proj"]
+)
+model = get_peft_model(model, peft_cfg)
+
+# >>> 同步 PAD，并显式设为“回归问题”以使用 MSELoss（labels 要 float）
+model.config.pad_token_id = pad_id
+model.config.problem_type = "regression"
+if getattr(model, "generation_config", None) is not None:
+    model.generation_config.pad_token_id = pad_id
+emb = model.get_input_embeddings()
+if hasattr(emb, "padding_idx") and (emb.padding_idx is None or emb.padding_idx < 0):
+    emb.padding_idx = pad_id
+
+# batch=1 + 梯度累积，最稳当
 args = TrainingArguments(
     output_dir="runs/rm",
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
     learning_rate=2e-5,
     num_train_epochs=1,
     logging_steps=20,
     fp16=True,
-    evaluation_strategy="no",
     save_strategy="epoch"
 )
 
 trainer = Trainer(model=model, args=args, train_dataset=ds)
 trainer.train()
+
 trainer.save_model("checkpoints/reward-model")
+tok.save_pretrained("checkpoints/reward-model")
+print("[RM] saved to checkpoints/reward-model")
