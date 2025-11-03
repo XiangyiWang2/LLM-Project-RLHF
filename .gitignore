@@ -1,6 +1,16 @@
 __pycache__/
+*.pyc
+.venv/
+.DS_Store
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
 runs/
-figures/
-checkpoints/
 *.log
-*.jsonl
+
+# 默认忽略 checkpoints，但允许下面三个子目录
+checkpoints/*
+!checkpoints/reward-model/**
+!checkpoints/sft-tinyllama/**
+!checkpoints/ppo-tinyllama/**
