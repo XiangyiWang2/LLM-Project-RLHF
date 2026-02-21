@@ -20,13 +20,13 @@ MAX_NEW_TOKENS = 64
 TOP_P = 0.9
 TEMPERATURE = 1.0
 
-BATCH_SIZE = 1           # 小批次稳定点
-UPDATES    = 500           # 训练步数（可加大，比如 200）
+BATCH_SIZE = 1           
+UPDATES    = 500          
 CLIP_EPS   = 0.02
 LR         = 1e-6
 VF_COEF    = 0.5
 ENT_COEF   = 0.0
-KL_COEF    = 0.1         # 轻微 KL 惩罚
+KL_COEF    = 0.1       
 
 random.seed(42)
 torch.manual_seed(42)
@@ -41,9 +41,6 @@ if tok_pol.pad_token is None:
     tok_pol.pad_token = tok_pol.eos_token
 tok_pol.padding_side = "left"
 
-# ----------------------------
-# Tokenizer (Reward Model)
-# ----------------------------
 tok_rm = AutoTokenizer.from_pretrained(BASE, use_fast=False)
 added_pad_to_rm = False
 if tok_rm.pad_token is None:
@@ -52,9 +49,6 @@ if tok_rm.pad_token is None:
 tok_rm.padding_side = "right"
 
 
-# ----------------------------
-# 加载 policy（SFT 作为初始化）与 reference（冻结，仅算 KL）
-# ----------------------------
 bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=DTYPE)
 
 def load_policy_with_lora():
@@ -67,9 +61,7 @@ policy = load_policy_with_lora()
 ref_model = load_policy_with_lora().eval()
 for p in ref_model.parameters(): p.requires_grad_(False)
 
-# ----------------------------
-# Value Head
-# ----------------------------
+
 HIDDEN = policy.base_model.model.model.embed_tokens.embedding_dim
 # [FIX 5.1] 将 value_head 显式转换为 DTYPE (float16)
 value_head = nn.Linear(HIDDEN, 1, bias=True).to(device=DEVICE, dtype=DTYPE)
@@ -77,27 +69,21 @@ value_head = nn.Linear(HIDDEN, 1, bias=True).to(device=DEVICE, dtype=DTYPE)
 train_params = list(filter(lambda p: p.requires_grad, policy.parameters())) + list(value_head.parameters())
 optimizer = torch.optim.AdamW(train_params, lr=LR)
 
-# ----------------------------
-# 奖励模型（SequenceClassification + LoRA）
-# ----------------------------
 rm_base = AutoModelForSequenceClassification.from_pretrained(
     BASE, num_labels=1, quantization_config=bnb, device_map="auto", torch_dtype=DTYPE
 )
 
-# [FIX 3.2] 必须在加载 LoRA 适配器之前 resize
+
 if added_pad_to_rm:
     rm_base.resize_token_embeddings(len(tok_rm))
 
-# [FIX 3.3] 同样必须设置 pad_token_id
+
 if tok_rm.pad_token_id is not None:
     rm_base.config.pad_token_id = tok_rm.pad_token_id
 
 rm = PeftModel.from_pretrained(rm_base, RM_PATH).eval()
 for p in rm.parameters(): p.requires_grad_(False)
 
-# ----------------------------
-# 任务数据
-# ----------------------------
 PROMPTS = [
     "Explain why the sky appears blue in a clear day.",
     "Give me a short study plan for a data structures exam.",
@@ -112,14 +98,12 @@ PROMPTS = [
 def format_prompt(p):
     return f"Human: {p}\nAssistant:"
 
-# ----------------------------
-# 生成回复
-# ----------------------------
+
 @torch.no_grad()
 def generate_texts(model, prompts):
     inputs = tok_pol([format_prompt(p) for p in prompts], return_tensors="pt", padding=True)
     
-    # [FIX 6.1] 手动将 inputs 移动到 model.device，防止 UserWarning
+
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     gen_ids = model.generate(
@@ -137,9 +121,7 @@ def generate_texts(model, prompts):
     texts = tok_pol.batch_decode(gen_ids, skip_special_tokens=True)
     return gen_ids, resp_lens, texts
 
-# ----------------------------
-# 辅助函数
-# ----------------------------
+
 def last_hidden(model, input_ids, attention_mask):
     out = model.base_model.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
     h = out.hidden_states[-1]
@@ -181,9 +163,7 @@ def rm_reward(texts):
 def approx_kl(cur_lp, ref_lp):
     return (cur_lp - ref_lp).mean()
 
-# ----------------------------
-# 训练循环
-# ----------------------------
+
 policy.train()
 value_head.train()
 
@@ -208,10 +188,10 @@ for step in range(1, UPDATES + 1):
     with torch.no_grad():
         last_h = last_hidden(policy, gen_ids, attn)
     
-    # [FIX 4.2] 显式将 last_h 移动到 value_head 所在的设备
+
     v = value_head(last_h.to(value_head.weight.device)).squeeze(-1) # v 现在在 CUDA 上
 
-    # [FIX 6.3] r (CPU) 必须移动到 v (CUDA) 所在的设备
+
     adv = (r.to(v.device) - v).detach()
     
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -224,7 +204,7 @@ for step in range(1, UPDATES + 1):
     b_token_lp = []
     for i, L in enumerate(resp_lens):
         if L <= 0:
-            # [FIX 8.3] 确保这个 tensor 也在 policy 的设备上
+
             b_token_lp.append(torch.tensor(0.0, device=lprobs.device, requires_grad=True))
             continue
         start = (attn[i].sum() - 1 - L).item()
@@ -244,15 +224,15 @@ for step in range(1, UPDATES + 1):
 
     with torch.set_grad_enabled(True):
         last_h2 = last_hidden(policy, gen_ids, attn)
-        # [FIX 4.3] 再次显式移动
+
         v2 = value_head(last_h2.to(value_head.weight.device)).squeeze(-1)
     
-    # [FIX 6.4] r (CPU) 必须移动到 v2 (CUDA) 所在的设备并转换 DTYPE
+
     value_loss = F.mse_loss(v2, r.to(v2.device, dtype=DTYPE))
 
     kl_loss = KL_COEF * kl
 
-    # [FIX 8.1] value_loss (cuda:3) 必须被移动到 policy_loss (cuda:1) 所在的设备
+
     loss = policy_loss + VF_COEF * value_loss.to(policy_loss.device) + kl_loss
 
     optimizer.zero_grad(set_to_none=True)
