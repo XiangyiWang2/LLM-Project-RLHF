@@ -18,7 +18,7 @@ peft_cfg = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                       target_modules=["q_proj","k_proj","v_proj","o_proj"], task_type="CAUSAL_LM")
 model = get_peft_model(model, peft_cfg)
 
-# 小样本 SFT 起点（OpenAssistant）
+
 ds = load_dataset("OpenAssistant/oasst1", split="train[:2%]")
 
 def to_text(ex):
