@@ -8,27 +8,26 @@ DEVICE_MAP = "auto"
 DTYPE = torch.float16
 
 BASE = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
-SFT_PATH = "checkpoints/sft-tinyllama"     # 你的 SFT（PEFT）
-RM_PATH  = "checkpoints/reward-model"      # 你的 RM（PEFT）
-OUT_DIR  = "checkpoints/ppo-tinyllama"     # 训练后策略保存到这里（04_eval 可直接读取）
-
+SFT_PATH = "checkpoints/sft-tinyllama"    
+RM_PATH  = "checkpoints/reward-model"  
+OUT_DIR  = "checkpoints/ppo-tinyllama"   
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# --- Tokenizer（用 RM 的，含 [PAD]，统一词表） ---
+
 tok = AutoTokenizer.from_pretrained(RM_PATH, use_fast=True)
 if tok.pad_token is None:
     tok.add_special_tokens({"pad_token": "[PAD]"})
 tok.padding_side = "left"
 vocab_size = len(tok)
 
-# --- 参考策略（冻结）：SFT 起点 ---
+
 ref_base = AutoModelForCausalLM.from_pretrained(
     BASE, torch_dtype=DTYPE, device_map=DEVICE_MAP
 )
 ref = PeftModel.from_pretrained(ref_base, SFT_PATH)
 ref.eval()
 
-# --- 当前策略（可训练）：从相同 SFT 起点 ---
+
 pol_base = AutoModelForCausalLM.from_pretrained(
     BASE, torch_dtype=DTYPE, device_map=DEVICE_MAP
 )
@@ -46,7 +45,7 @@ def ensure_resize(model):
 
 ensure_resize(ref); ensure_resize(policy)
 
-# --- 奖励模型（冻结） ---
+
 rm_base = AutoModelForSequenceClassification.from_pretrained(
     BASE, num_labels=1, torch_dtype=DTYPE, device_map=DEVICE_MAP
 )
@@ -54,19 +53,19 @@ ensure_resize(rm_base)
 rm = PeftModel.from_pretrained(rm_base, RM_PATH)
 rm.eval()
 
-# === 数据：SHP prompt 子集 ===
+
 raw = load_dataset("stanfordnlp/SHP", split="train[:1%]")
 prompts = [ex.get("history","") for ex in raw if isinstance(ex.get("history",""), str) and len(ex["history"])>0]
 random.seed(42); random.shuffle(prompts)
 prompts = prompts[:512]
 
-# === 超参 ===
-BATCH = 8                 # 显存不够就降到 4/2
+
+BATCH = 8              
 STEPS = math.ceil(len(prompts)/BATCH)
 MAX_NEW = 128
 TOP_P = 0.9
 TEMP  = 1.0
-BETA  = 0.02              # KL 系数
+BETA  = 0.02            
 LR    = 1e-5
 
 optim = torch.optim.AdamW(policy.parameters(), lr=LR)
@@ -90,13 +89,13 @@ def seq_logprob(model, full_ids, resp_len, need_grad):
         ctx = contextlib.nullcontext() if need_grad else torch.no_grad()
 
     with ctx:
-        logits = model(full_ids[:, :-1]).logits            # 预测下一个 token
-        targets = full_ids[:, 1:]                          # 对齐为要预测的 token 序列
-        logits_resp  = logits[:, -resp_len:, :]            # 仅响应区间
+        logits = model(full_ids[:, :-1]).logits          
+        targets = full_ids[:, 1:]                         
+        logits_resp  = logits[:, -resp_len:, :]          
         targets_resp = targets[:, -resp_len:]
         logprobs = torch.log_softmax(logits_resp, dim=-1)
-        token_lp = logprobs.gather(-1, targets_resp.unsqueeze(-1)).squeeze(-1)  # [bs, T_resp]
-        seq_lp   = token_lp.sum(dim=-1)                     # [bs]
+        token_lp = logprobs.gather(-1, targets_resp.unsqueeze(-1)).squeeze(-1)  
+        seq_lp   = token_lp.sum(dim=-1)                   
     return seq_lp
 
 def rm_score(texts):
@@ -105,27 +104,27 @@ def rm_score(texts):
         s = rm(**inputs).logits.squeeze(-1).float().detach()
     return s.to(model_device(policy))
 
-# === 训练回合 ===
+
 for step in range(STEPS):
     batch = prompts[step*BATCH:(step+1)*BATCH]
     if not batch: break
 
-    # 用“当前策略”采样
+
     prompt_ids, resp_ids = sample_response(policy, batch)
     full_ids = torch.cat([prompt_ids.to(model_device(policy)), resp_ids.to(model_device(policy))], dim=1)
     resp_len = resp_ids.shape[1]
 
-    # 句级 logprob
-    lp_cur = seq_logprob(policy, full_ids, resp_len, need_grad=True)   # 带梯度
-    lp_ref = seq_logprob(ref,    full_ids, resp_len, need_grad=False)  # 冻结
 
-    # KL + RM 奖励
-    kl  = (lp_cur - lp_ref)                      # 偏离参考策略
+    lp_cur = seq_logprob(policy, full_ids, resp_len, need_grad=True) 
+    lp_ref = seq_logprob(ref,    full_ids, resp_len, need_grad=False)  
+
+
+    kl  = (lp_cur - lp_ref)               
     texts = [f"Human: {p}\nAssistant: {r}" for p, r in zip(batch, tok.batch_decode(resp_ids, skip_special_tokens=True))]
     rew = rm_score(texts)
 
-    # REINFORCE 目标：maximize (rew - beta*KL) * lp_cur
-    advantage = (rew - BETA * kl).detach()       # baseline/权重，不回传梯度
+
+    advantage = (rew - BETA * kl).detach()     
     loss = -(advantage * lp_cur).mean()
 
     optim.zero_grad(set_to_none=True)
@@ -136,7 +135,7 @@ for step in range(STEPS):
     if (step+1) % 5 == 0 or step == 0:
         print(f"[RL] step {step+1}/{STEPS} | loss={loss.item():.4f} | rew={rew.mean().item():.3f} | kl={kl.mean().item():.3f}")
 
-# 保存
+
 policy.eval()
 policy.save_pretrained(OUT_DIR)
 tok.save_pretrained(OUT_DIR)
