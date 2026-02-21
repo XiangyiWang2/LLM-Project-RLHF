@@ -11,7 +11,7 @@ import torch
 
 BASE = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
 
-# --- Tokenizer & PAD ---
+
 tok = AutoTokenizer.from_pretrained(BASE, use_fast=False)
 added_pad = False
 if tok.pad_token is None:
@@ -20,7 +20,7 @@ if tok.pad_token is None:
 tok.padding_side = "right"
 pad_id = tok.pad_token_id
 
-# --- Data: SHP（3k 起步） ---
+
 ds = load_dataset("stanfordnlp/SHP", split="train").shuffle(seed=42).select(range(3000))
 
 def map_pair(ex):
@@ -37,17 +37,17 @@ ds = ds.map(map_pair)
 def tokenize_batch(batch):
     pos = tok(batch["pos"], padding="max_length", truncation=True, max_length=512)
     neg = tok(batch["neg"], padding="max_length", truncation=True, max_length=512)
-    # 关键：labels 用 float（0.0/1.0），避免 Long dtype 报错
+
     return {
         "input_ids": pos["input_ids"] + neg["input_ids"],
         "attention_mask": pos["attention_mask"] + neg["attention_mask"],
         "labels": [1.0] * len(batch["pos"]) + [0.0] * len(batch["neg"]),
     }
 ds = ds.map(tokenize_batch, batched=True, remove_columns=ds.column_names)
-# 强制列类型为 float32，彻底稳
+
 ds = ds.cast_column("labels", Value("float32"))
 
-# --- Model: 4bit + LoRA（SequenceClassification） ---
+
 bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
 model = AutoModelForSequenceClassification.from_pretrained(
     BASE, num_labels=1, quantization_config=bnb, device_map="auto"
@@ -63,7 +63,7 @@ peft_cfg = LoraConfig(
 )
 model = get_peft_model(model, peft_cfg)
 
-# >>> 同步 PAD，并显式设为“回归问题”以使用 MSELoss（labels 要 float）
+
 model.config.pad_token_id = pad_id
 model.config.problem_type = "regression"
 if getattr(model, "generation_config", None) is not None:
@@ -72,7 +72,6 @@ emb = model.get_input_embeddings()
 if hasattr(emb, "padding_idx") and (emb.padding_idx is None or emb.padding_idx < 0):
     emb.padding_idx = pad_id
 
-# batch=1 + 梯度累积，最稳当
 args = TrainingArguments(
     output_dir="runs/rm",
     per_device_train_batch_size=1,
